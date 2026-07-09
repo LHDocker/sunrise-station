@@ -1,0 +1,121 @@
+name: mirror-build-server
+
+# Builds the Space Station 14 fork "space-sunrise/sunrise-station" server from source
+# and publishes SS14.Server_linux-x64.zip as a GitHub Release.
+# Drop this into a fork of space-sunrise/sunrise-station at
+# .github/workflows/mirror-build-server.yml
+#
+# Adapted from the LHDocker vanilla/Goob mirror. Sunrise specifics:
+#   - upstream repo  = space-sunrise/sunrise-station (branch master)
+#   - .NET           = 10  (sunrise global.json pins sdk 10.0.100 as of 2026-07-07;
+#                           always match the repo's global.json)
+#   => the RUNTIME Docker image for these builds must be dotnet_10 to match.
+#   - engine         = space-wizards/RobustToolbox submodule; we run the SS14
+#                      submodule-dependency action to align it (matches sunrise's own CI).
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # nightly 08:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-build-server
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout upstream sunrise master (+ engine submodules)
+        uses: actions/checkout@v4
+        with:
+          repository: space-sunrise/sunrise-station
+          ref: master
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Resolve upstream version
+        id: ver
+        run: |
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=server-$(date -u +%Y.%m.%d)-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this commit was already released
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.ver.outputs.tag }}" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.ver.outputs.tag }} already exists - skipping build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Match the upstream global.json. Sunrise = .NET 10 as of 2026-07-07.
+      # If a future exit-150 ".NET version" error appears, re-check global.json and bump this.
+      - name: Setup .NET 10
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # Sunrise's own CI aligns the RobustToolbox submodule via this action. Kept for fidelity.
+      - name: Align engine submodule (SS14 dependency action)
+        if: steps.check.outputs.exists == 'false'
+        uses: space-wizards/submodule-dependency@v0.1.5
+
+      - name: Build & package server (linux-x64)
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          set -e
+          dotnet restore
+          dotnet build Content.Packaging --configuration Release --no-restore /m
+          dotnet run --project Content.Packaging server --platform linux-x64
+
+      - name: List build output
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          echo "--- release/ ---"; ls -la release/ 2>/dev/null || true
+
+      - name: Publish GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          # server packaging emits release/SS14.Server_linux-x64.zip
+          f=$(ls release/SS14.Server_linux-x64.zip 2>/dev/null || ls release/*.zip | head -1)
+          echo "Artifact: $f"
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            -R "${{ github.repository }}" \
+            -t "Sunrise SS14 server ${{ steps.ver.outputs.tag }}" \
+            -n "Automated server build of upstream space-sunrise/sunrise-station@${{ steps.ver.outputs.sha }} ($(date -u +'%Y-%m-%d %H:%M UTC'))" \
+            --latest \
+            "$f"
+
+      - name: Mirror fork master = upstream master + this workflow
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tmp=$(mktemp -d)
+          git clone --depth=1 --branch master "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$tmp/m"
+          cd "$tmp/m"
+          cp .github/workflows/mirror-build-server.yml "$tmp/wf.yml"
+          git config user.name "lhdocker-ci"
+          git config user.email "ci@legionhosting.net"
+          git remote add upstream https://github.com/space-sunrise/sunrise-station.git
+          git fetch --depth=1 upstream master
+          git checkout -B master upstream/master
+          mkdir -p .github/workflows
+          cp "$tmp/wf.yml" .github/workflows/mirror-build-server.yml
+          git add .github/workflows/mirror-build-server.yml
+          git commit -m "mirror: upstream master + ci workflow [skip ci]"
+          git push --force origin master
+          echo "fork master now mirrors upstream master + workflow overlay"
